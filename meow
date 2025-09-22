@@ -1,0 +1,296 @@
+#include <windows.h>
+#include <commctrl.h>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <filesystem>
+#include <thread>
+
+#pragma comment(lib, "comctl32.lib")
+
+namespace fs = std::filesystem;
+
+// -------------------- IDs --------------------
+#define ID_PULL_TOGGLE 101
+#define ID_SLIDER_PULLDOWN 102
+#define ID_SLIDER_PULLRIGHT 103
+#define ID_SLIDER_PULLLEFT 104
+#define ID_SLIDER_SMOOTH 105
+#define ID_BUTTON_SAVE 106
+#define ID_BUTTON_LOAD 107
+#define ID_COMBO_CONFIGS 108
+#define ID_CHECK_REQUIREDADS 109
+#define ID_SLIDER_ADSDELAY 110
+#define ID_BUTTON_RAPIDTOGGLE 111
+#define ID_SLIDER_RAPIDSPEED 112
+
+// -------------------- Config --------------------
+struct Config {
+    int pullDown = 5;
+    int pullRight = 0;
+    int pullLeft = 0;
+    int smoothness = 10;
+    bool enabled = false;
+    bool rapidFireToggled = false;
+    bool requiredADS = false;
+    int rapidFireSpeed = 50;
+    int requiredADSSpeed = 100;
+} gConfig;
+
+// -------------------- Globals --------------------
+HWND hPullToggle, hSliderDown, hSliderRight, hSliderLeft, hSliderSmooth;
+HWND hButtonSave, hButtonLoad, hComboConfigs;
+HWND hCheckRequiredADS, hSliderADSDelay;
+HWND hButtonRapidToggle, hSliderRapidSpeed;
+
+std::vector<std::string> configList;
+int selectedConfig = -1;
+bool running = true;
+
+// -------------------- Helpers --------------------
+std::string GetConfigFolder() { return "configs"; }
+
+void RefreshConfigList(HWND hCombo) {
+    SendMessage(hCombo, CB_RESETCONTENT, 0, 0);
+    configList.clear();
+    if (!fs::exists(GetConfigFolder())) fs::create_directory(GetConfigFolder());
+    for (auto& entry : fs::directory_iterator(GetConfigFolder())) {
+        if (entry.path().extension() == ".cfg") {
+            configList.push_back(entry.path().stem().string());
+            SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)entry.path().stem().string().c_str());
+        }
+    }
+}
+
+void SaveConfig(const std::string& name) {
+    std::ofstream out(GetConfigFolder() + "/" + name + ".cfg", std::ios::binary);
+    if (!out.is_open()) return;
+    out.write((char*)&gConfig, sizeof(gConfig));
+}
+
+void LoadConfig(const std::string& name) {
+    std::ifstream in(GetConfigFolder() + "/" + name + ".cfg", std::ios::binary);
+    if (!in.is_open()) return;
+    in.read((char*)&gConfig, sizeof(gConfig));
+    in.close();
+    SendMessage(hSliderDown, TBM_SETPOS, TRUE, gConfig.pullDown);
+    SendMessage(hSliderRight, TBM_SETPOS, TRUE, gConfig.pullRight);
+    SendMessage(hSliderLeft, TBM_SETPOS, TRUE, gConfig.pullLeft);
+    SendMessage(hSliderSmooth, TBM_SETPOS, TRUE, gConfig.smoothness);
+    SendMessage(hCheckRequiredADS, BM_SETCHECK, gConfig.requiredADS ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(hSliderADSDelay, TBM_SETPOS, TRUE, gConfig.requiredADSSpeed);
+    SendMessage(hSliderRapidSpeed, TBM_SETPOS, TRUE, gConfig.rapidFireSpeed);
+}
+
+// -------------------- Mouse Helpers --------------------
+void MoveMouseSmoothly(int dx, int dy, int steps = 5) {
+    POINT p; GetCursorPos(&p);
+    float stepX = dx / (float)steps;
+    float stepY = dy / (float)steps;
+    for (int i = 0; i < steps; i++) {
+        SetCursorPos(p.x + (int)((i + 1) * stepX), p.y + (int)((i + 1) * stepY));
+        Sleep(gConfig.smoothness / steps);
+    }
+}
+
+void MouseThread() {
+    while (running) {
+        if (gConfig.enabled && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+            bool adsOk = true;
+            if (gConfig.requiredADS)
+                adsOk = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) && (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
+
+            if (adsOk) {
+                MoveMouseSmoothly(gConfig.pullRight - gConfig.pullLeft, gConfig.pullDown, 5);
+                if (gConfig.rapidFireToggled) {
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                    Sleep(gConfig.rapidFireSpeed);
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                }
+            }
+        }
+        Sleep(1);
+    }
+}
+
+// -------------------- Custom Slider Drawing --------------------
+void DrawSlider(HDC hdc, RECT rect, int pos, int min, int max) {
+    HBRUSH trackBrush = CreateSolidBrush(RGB(0,0,255));
+    RECT trackRect = rect;
+    trackRect.top += (rect.bottom - rect.top) / 3;
+    trackRect.bottom = trackRect.top + 6;
+    FillRect(hdc, &trackRect, trackBrush);
+    DeleteObject(trackBrush);
+
+    int thumbX = rect.left + ((pos - min) * (rect.right - rect.left)) / (max - min);
+    RECT thumbRect = {thumbX - 5, rect.top, thumbX + 5, rect.bottom};
+    HBRUSH thumbBrush = CreateSolidBrush(RGB(255,255,255));
+    FillRect(hdc, &thumbRect, thumbBrush);
+    DeleteObject(thumbBrush);
+}
+
+// -------------------- Win32 GUI --------------------
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch(msg) {
+    case WM_COMMAND:
+        switch(LOWORD(wParam)) {
+            case ID_PULL_TOGGLE:
+                gConfig.enabled = !gConfig.enabled;
+                SetWindowText(hPullToggle, gConfig.enabled ? "Pull: ON" : "Pull: OFF");
+                InvalidateRect(hwnd, NULL, TRUE);
+                break;
+            case ID_BUTTON_SAVE:
+                SaveConfig("default"); RefreshConfigList(hComboConfigs);
+                break;
+            case ID_BUTTON_LOAD:
+                if(selectedConfig>=0) LoadConfig(configList[selectedConfig]);
+                break;
+            case ID_COMBO_CONFIGS:
+                selectedConfig = SendMessage(hComboConfigs, CB_GETCURSEL, 0, 0);
+                break;
+            case ID_BUTTON_RAPIDTOGGLE:
+                gConfig.rapidFireToggled = !gConfig.rapidFireToggled;
+                SetWindowText(hButtonRapidToggle, gConfig.rapidFireToggled ? "Rapid Fire: ON":"Rapid Fire: OFF");
+                InvalidateRect(hwnd,NULL,TRUE);
+                break;
+            case ID_CHECK_REQUIREDADS:
+                gConfig.requiredADS = SendMessage(hCheckRequiredADS,BM_GETCHECK,0,0) == BST_CHECKED;
+                break;
+        }
+        break;
+    case WM_HSCROLL:
+        gConfig.pullDown = SendMessage(hSliderDown,TBM_GETPOS,0,0);
+        gConfig.pullRight = SendMessage(hSliderRight,TBM_GETPOS,0,0);
+        gConfig.pullLeft = SendMessage(hSliderLeft,TBM_GETPOS,0,0);
+        gConfig.smoothness = SendMessage(hSliderSmooth,TBM_GETPOS,0,0);
+        gConfig.requiredADSSpeed = SendMessage(hSliderADSDelay,TBM_GETPOS,0,0);
+        gConfig.rapidFireSpeed = SendMessage(hSliderRapidSpeed,TBM_GETPOS,0,0);
+        InvalidateRect(hwnd,NULL,TRUE);
+        break;
+    case WM_CTLCOLORBTN:
+        {
+            HDC hdcButton = (HDC)wParam; SetTextColor(hdcButton, RGB(0,0,255)); SetBkMode(hdcButton, TRANSPARENT);
+            HWND hwndButton = (HWND)lParam; char text[256]; GetWindowText(hwndButton,text,256); std::string strText(text);
+            COLORREF bgColor = RGB(255,0,0);
+            if(strText.find("ON")!=std::string::npos) bgColor = RGB(0,255,0);
+            static HBRUSH hBrush = CreateSolidBrush(bgColor); return (INT_PTR)hBrush;
+        }
+    case WM_CTLCOLORSTATIC:
+        {
+            HDC hdcStatic = (HDC)wParam; SetTextColor(hdcStatic, RGB(0,0,255)); SetBkMode(hdcStatic,TRANSPARENT);
+            static HBRUSH hBrush = CreateSolidBrush(RGB(128,0,128)); return (INT_PTR)hBrush;
+        }
+    case WM_ERASEBKGND:
+        {
+            HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hwnd,&rc);
+            HBRUSH brush = CreateSolidBrush(RGB(128,0,128));
+            FillRect(hdc,&rc); DeleteObject(brush); return 1;
+        }
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd,&ps);
+            SetTextColor(hdc,RGB(0,0,255)); SetBkMode(hdc,TRANSPARENT);
+            TextOut(hdc,350,10,"Skitzs Anti Recoil",19);
+
+            DrawSlider(hdc,{20,60,220,80},gConfig.pullDown,0,20);
+            DrawSlider(hdc,{20,100,220,120},gConfig.pullRight,0,20);
+            DrawSlider(hdc,{20,140,220,160},gConfig.pullLeft,0,20);
+            DrawSlider(hdc,{20,180,220,200},gConfig.smoothness,1,50);
+            DrawSlider(hdc,{20,260,220,280},gConfig.requiredADSSpeed,50,200);
+            DrawSlider(hdc,{20,340,220,360},gConfig.rapidFireSpeed,1,200);
+
+            EndPaint(hwnd,&ps);
+        }
+        break;
+    case WM_CLOSE:
+        running = false;
+        DestroyWindow(hwnd);
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    default: return DefWindowProc(hwnd,msg,wParam,lParam);
+    }
+    return 0;
+}
+
+// -------------------- WinMain --------------------
+int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,HINSTANCE hExe,LPSTR lpCmdLine){
+    InitCommonControls();
+
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = "AntiRecoilWindow";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
+    RegisterClass(&wc);
+
+    HWND hwnd = CreateWindowEx(0,"AntiRecoilWindow","Anti Recoil",WS_OVERLAPPEDWINDOW,
+        100,100,600,450,NULL,NULL,hInst,NULL);
+    ShowWindow(hwnd,SW_SHOW);
+
+    // --- Create controls ---
+    hPullToggle = CreateWindow("BUTTON","Pull: OFF",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+        250,50,100,30,hwnd,(HMENU)ID_PULL_TOGGLE,hInst,NULL);
+
+    hSliderDown = CreateWindow(TRACKBAR_CLASS,NULL,WS_CHILD|WS_VISIBLE|TBS_AUTOTICKS,
+        20,60,220,30,hwnd,(HMENU)ID_SLIDER_PULLDOWN,hInst,NULL);
+    SendMessage(hSliderDown,TBM_SETRANGE,TRUE,MAKELONG(0,20));
+    SendMessage(hSliderDown,TBM_SETPOS,TRUE,gConfig.pullDown);
+
+    hSliderRight = CreateWindow(TRACKBAR_CLASS,NULL,WS_CHILD|WS_VISIBLE|TBS_AUTOTICKS,
+        20,100,220,30,hwnd,(HMENU)ID_SLIDER_PULLRIGHT,hInst,NULL);
+    SendMessage(hSliderRight,TBM_SETRANGE,TRUE,MAKELONG(0,20));
+    SendMessage(hSliderRight,TBM_SETPOS,TRUE,gConfig.pullRight);
+
+    hSliderLeft = CreateWindow(TRACKBAR_CLASS,NULL,WS_CHILD|WS_VISIBLE|TBS_AUTOTICKS,
+        20,140,220,30,hwnd,(HMENU)ID_SLIDER_PULLLEFT,hInst,NULL);
+    SendMessage(hSliderLeft,TBM_SETRANGE,TRUE,MAKELONG(0,20));
+    SendMessage(hSliderLeft,TBM_SETPOS,TRUE,gConfig.pullLeft);
+
+    hSliderSmooth = CreateWindow(TRACKBAR_CLASS,NULL,WS_CHILD|WS_VISIBLE|TBS_AUTOTICKS,
+        20,180,220,30,hwnd,(HMENU)ID_SLIDER_SMOOTH,hInst,NULL);
+    SendMessage(hSliderSmooth,TBM_SETRANGE,TRUE,MAKELONG(1,50));
+    SendMessage(hSliderSmooth,TBM_SETPOS,TRUE,gConfig.smoothness);
+
+    hCheckRequiredADS = CreateWindow("BUTTON","Required ADS",WS_CHILD|WS_VISIBLE|BS_CHECKBOX,
+        250,100,120,30,hwnd,(HMENU)ID_CHECK_REQUIREDADS,hInst,NULL);
+
+    hSliderADSDelay = CreateWindow(TRACKBAR_CLASS,NULL,WS_CHILD|WS_VISIBLE|TBS_AUTOTICKS,
+        20,260,220,30,hwnd,(HMENU)ID_SLIDER_ADSDELAY,hInst,NULL);
+    SendMessage(hSliderADSDelay,TBM_SETRANGE,TRUE,MAKELONG(50,200));
+    SendMessage(hSliderADSDelay,TBM_SETPOS,TRUE,gConfig.requiredADSSpeed);
+
+    hButtonRapidToggle = CreateWindow("BUTTON","Rapid Fire: OFF",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+        250,150,120,30,hwnd,(HMENU)ID_BUTTON_RAPIDTOGGLE,hInst,NULL);
+
+    hSliderRapidSpeed = CreateWindow(TRACKBAR_CLASS,NULL,WS_CHILD|WS_VISIBLE|TBS_AUTOTICKS,
+        20,340,220,30,hwnd,(HMENU)ID_SLIDER_RAPIDSPEED,hInst,NULL);
+    SendMessage(hSliderRapidSpeed,TBM_SETRANGE,TRUE,MAKELONG(1,200));
+    SendMessage(hSliderRapidSpeed,TBM_SETPOS,TRUE,gConfig.rapidFireSpeed);
+
+    hButtonSave = CreateWindow("BUTTON","Save Config",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+        250,200,120,30,hwnd,(HMENU)ID_BUTTON_SAVE,hInst,NULL);
+
+    hButtonLoad = CreateWindow("BUTTON","Load Config",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+        380,200,120,30,hwnd,(HMENU)ID_BUTTON_LOAD,hInst,NULL);
+
+    hComboConfigs = CreateWindow("COMBOBOX",NULL,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
+        250,240,250,100,hwnd,(HMENU)ID_COMBO_CONFIGS,hInst,NULL);
+    RefreshConfigList(hComboConfigs);
+
+    // --- Start mouse thread ---
+    std::thread t(MouseThread);
+    t.detach();
+
+    // --- Message loop ---
+    MSG msg;
+    while(GetMessage(&msg,NULL,0,0)){
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    running = false;
+    Sleep(50); // give thread time to exit
+    return 0;
+}
